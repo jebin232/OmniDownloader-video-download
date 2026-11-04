@@ -69,6 +69,29 @@ def get_cache_dir():
     return tempfile.gettempdir()
 
 
+def get_cookie_file():
+    """Checks for cookie file to bypass YouTube cloud bot detection."""
+    cookie_paths = [
+        os.path.join(BASE_DIR, "cookies.txt"),
+        os.path.join(os.getcwd(), "cookies.txt"),
+        os.path.join("/tmp", "cookies.txt"),
+    ]
+    for cp in cookie_paths:
+        if os.path.isfile(cp):
+            return cp
+    # Check if cookies are passed in environment
+    env_cookies = os.environ.get("YOUTUBE_COOKIES")
+    if env_cookies:
+        tmp_cookie = os.path.join(get_cache_dir(), "env_cookies.txt")
+        try:
+            with open(tmp_cookie, "w", encoding="utf-8") as f:
+                f.write(env_cookies)
+            return tmp_cookie
+        except Exception:
+            pass
+    return None
+
+
 def get_ffmpeg_path():
     """Finds ffmpeg executable from PATH or the imageio_ffmpeg package."""
     system_ffmpeg = shutil.which("ffmpeg")
@@ -139,8 +162,9 @@ def make_safe_filename(raw_title, ext="mp4", max_len=60):
 
 
 def parse_video_formats(info):
-    """Extracts, deduplicates, and organizes formats for any platform."""
+    """Extracts, deduplicates, and organizes formats for any platform from top to low quality."""
     raw_formats = info.get("formats") or []
+    duration = info.get("duration") or 0
     items = []
 
     # Handle single stream platforms
@@ -162,6 +186,8 @@ def parse_video_formats(info):
     for f in raw_formats:
         if f.get("vcodec") == "none" and f.get("acodec") != "none":
             sz = f.get("filesize") or f.get("filesize_approx") or 0
+            if not sz and duration and (f.get("tbr") or f.get("abr")):
+                sz = int((f.get("tbr") or f.get("abr")) * 1000 / 8 * duration)
             if sz > max_audio_size:
                 max_audio_size = sz
 
@@ -182,14 +208,16 @@ def parse_video_formats(info):
         f for f in raw_formats
         if (f.get("vcodec") != "none" or f.get("video_ext") != "none")
         and f.get("ext") != "mhtml"
+        and (f.get("height") or 0) > 0
     ]
 
+    # Sort strictly from highest resolution to lowest, then bitrate/fps desc
     sorted_videos = sorted(
         valid_videos,
         key=lambda x: (
             x.get("height") or 0,
-            x.get("fps") or 0,
             x.get("tbr") or x.get("vbr") or 0,
+            x.get("fps") or 0,
         ),
         reverse=True,
     )
@@ -210,9 +238,8 @@ def parse_video_formats(info):
         if h > 0:
             seen.add(key)
 
-        res_tag = f"{h}p" if h > 0 else (f.get("format_note") or "Video")
-        if fps > 30 and h > 0:
-            res_tag += f" {fps}fps"
+        fps_label = f" {fps}fps" if fps and fps > 30 else ""
+        res_tag = f"{h}p{fps_label}"
 
         if h >= 2160:
             res_tag += " (4K UHD)"
@@ -226,8 +253,11 @@ def parse_video_formats(info):
             res_tag += " (SD)"
 
         v_size = f.get("filesize") or f.get("filesize_approx") or 0
+        if not v_size and duration and (f.get("tbr") or f.get("vbr")):
+            v_size = int((f.get("tbr") or f.get("vbr")) * 1000 / 8 * duration)
+
         tot_size = v_size + (0 if has_audio else max_audio_size)
-        size_str = f"{tot_size / (1024 * 1024):.1f} MB" if tot_size > 0 else "Adaptive"
+        size_str = f"{tot_size / (1024 * 1024):.1f} MB" if tot_size > 0 else "High Quality"
 
         if has_audio:
             fmt_spec = fid
@@ -312,16 +342,25 @@ def get_info():
         return jsonify({"error": "Please enter a valid video link."}), 400
 
     ffmpeg_bin = get_ffmpeg_path()
+    cookie_file = get_cookie_file()
+
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["tv_embedded", "ios_embedded", "android_creator"]
+            }
+        },
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         },
     }
     if ffmpeg_bin:
         ydl_opts["ffmpeg_location"] = ffmpeg_bin
+    if cookie_file:
+        ydl_opts["cookiefile"] = cookie_file
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -356,6 +395,12 @@ def get_info():
         })
     except Exception as e:
         err = clean_ansi(str(e))
+        if "Sign in to confirm you're not a bot" in err:
+            err = (
+                "YouTube flagged Vercel's cloud server as a bot. "
+                "To download YouTube videos without limits, open the app locally at http://localhost:5000 "
+                "or export a cookies.txt file to the project."
+            )
         return jsonify({"error": err}), 500
 
 
@@ -421,6 +466,7 @@ def _download_worker(task_id, url, format_spec, merge_format, is_audio_only, aud
             task["percent"] = 99.0
             task["stage"] = "Merging streams with FFmpeg..."
 
+    cookie_file = get_cookie_file()
     ydl_opts = {
         "format": format_spec,
         "outtmpl": outtmpl,
@@ -428,10 +474,17 @@ def _download_worker(task_id, url, format_spec, merge_format, is_audio_only, aud
         "progress_hooks": [progress_hook],
         "quiet": True,
         "no_warnings": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["tv_embedded", "ios_embedded", "android_creator"]
+            }
+        },
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         },
     }
+    if cookie_file:
+        ydl_opts["cookiefile"] = cookie_file
 
     if merge_format and not is_audio_only:
         ydl_opts["merge_output_format"] = merge_format
@@ -472,7 +525,13 @@ def _download_worker(task_id, url, format_spec, merge_format, is_audio_only, aud
 
     except Exception as e:
         task["state"] = "error"
-        task["error"] = clean_ansi(str(e))
+        err = clean_ansi(str(e))
+        if "Sign in to confirm you're not a bot" in err:
+            err = (
+                "YouTube flagged Vercel's cloud server as a bot. "
+                "Open the app locally at http://localhost:5000 to download without restriction."
+            )
+        task["error"] = err
         task["stage"] = "Download failed."
 
 
