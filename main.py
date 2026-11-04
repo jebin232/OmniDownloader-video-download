@@ -32,13 +32,41 @@ except ImportError:
 
 # Base directories
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DOWNLOAD_CACHE_DIR = os.path.join(BASE_DIR, "downloads_cache")
-os.makedirs(DOWNLOAD_CACHE_DIR, exist_ok=True)
 
-app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"))
+# Locate template directory across local run and Vercel environments
+template_dirs = [
+    os.path.join(BASE_DIR, "templates"),
+    os.path.join(BASE_DIR, "api", "templates"),
+    os.path.join(os.path.dirname(BASE_DIR), "templates"),
+    os.path.join(os.getcwd(), "templates"),
+    os.path.join(os.getcwd(), "api", "templates"),
+]
+valid_template_dir = next((d for d in template_dirs if os.path.isdir(d)), os.path.join(BASE_DIR, "templates"))
+
+app = Flask(__name__, template_folder=valid_template_dir)
 
 # In-memory store for active download tasks
 TASKS = {}
+
+
+def get_cache_dir():
+    """Lazily finds a writable directory for temporary downloads (safe for Vercel/Lambda)."""
+    candidates = [
+        os.path.join("/tmp", "downloads_cache"),
+        os.path.join(BASE_DIR, "downloads_cache"),
+    ]
+    for p in candidates:
+        try:
+            os.makedirs(p, exist_ok=True)
+            test_file = os.path.join(p, f".write_test_{uuid.uuid4().hex[:6]}")
+            with open(test_file, "w") as f:
+                f.write("ok")
+            os.remove(test_file)
+            return p
+        except Exception:
+            continue
+    import tempfile
+    return tempfile.gettempdir()
 
 
 def get_ffmpeg_path():
@@ -102,13 +130,9 @@ def make_safe_filename(raw_title, ext="mp4", max_len=60):
     """Creates a clean, safe filename free of newlines, path length issues, and illegal characters."""
     if not raw_title:
         return f"video.{ext}"
-    # Remove newlines, tabs, and unprintable characters
     cleaned = re.sub(r"[\r\n\t]+", " ", str(raw_title))
-    # Remove characters forbidden on Windows and web filesystems
     cleaned = re.sub(r'[\\/*?:"<>|#%&{}\\<>*?/$!\'":@]', "", cleaned)
-    # Collapse multiple spaces into one
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
-    # Truncate to reasonable length to avoid MAX_PATH issues
     if len(cleaned) > max_len:
         cleaned = cleaned[:max_len].rstrip(" .")
     return f"{cleaned or 'video'}.{ext}"
@@ -119,7 +143,7 @@ def parse_video_formats(info):
     raw_formats = info.get("formats") or []
     items = []
 
-    # Handle single stream platforms (e.g. some Instagram or FB direct videos)
+    # Handle single stream platforms
     if not raw_formats:
         ext = info.get("ext") or "mp4"
         items.append({
@@ -134,7 +158,6 @@ def parse_video_formats(info):
         })
         return items
 
-    # Best audio size for approx combined size
     max_audio_size = 0
     for f in raw_formats:
         if f.get("vcodec") == "none" and f.get("acodec") != "none":
@@ -161,7 +184,6 @@ def parse_video_formats(info):
         and f.get("ext") != "mhtml"
     ]
 
-    # Sort by resolution desc, fps desc, bitrate desc
     sorted_videos = sorted(
         valid_videos,
         key=lambda x: (
@@ -259,8 +281,19 @@ def parse_video_formats(info):
 
 @app.route("/")
 def index():
-    """Serves the main single page web application."""
-    return render_template("index.html")
+    """Serves the main single page web application with fallback loaders."""
+    try:
+        return render_template("index.html")
+    except Exception:
+        for d in template_dirs:
+            p = os.path.join(d, "index.html")
+            if os.path.isfile(p):
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        return f.read(), 200, {"Content-Type": "text/html; charset=utf-8"}
+                except Exception:
+                    pass
+        return "<h1>OmniDownloader</h1><p>Template loading error. Please refresh.</p>", 200
 
 
 @app.route("/favicon.ico")
@@ -294,13 +327,11 @@ def get_info():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        # Handle playlists or single entries
         if "entries" in info:
             entries = list(info.get("entries") or [])
             if entries:
                 info = entries[0]
 
-        # Clean title: keep first line and truncate to 120 chars
         raw_title = info.get("title") or "Video Download"
         title = re.sub(r"[\r\n\t]+", " ", str(raw_title)).strip()
         if len(title) > 120:
@@ -354,7 +385,6 @@ def start_download():
         "timestamp": time.time(),
     }
 
-    # Start background download thread
     thread = threading.Thread(
         target=_download_worker,
         args=(task_id, url, format_spec, merge_format, is_audio_only, audio_codec, raw_title),
@@ -370,10 +400,9 @@ def _download_worker(task_id, url, format_spec, merge_format, is_audio_only, aud
     task = TASKS[task_id]
     ffmpeg_bin = get_ffmpeg_path()
 
-    task_dir = os.path.join(DOWNLOAD_CACHE_DIR, task_id)
+    task_dir = os.path.join(get_cache_dir(), task_id)
     os.makedirs(task_dir, exist_ok=True)
 
-    # Use a fixed, safe output template to prevent illegal characters or path limits
     outtmpl = os.path.join(task_dir, "media.%(ext)s")
 
     def progress_hook(d):
@@ -422,7 +451,6 @@ def _download_worker(task_id, url, format_spec, merge_format, is_audio_only, aud
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
-        # Locate the downloaded file in task_dir
         found_files = [
             f for f in os.listdir(task_dir)
             if not f.endswith(".part") and not f.endswith(".ytdl")
@@ -433,7 +461,6 @@ def _download_worker(task_id, url, format_spec, merge_format, is_audio_only, aud
         actual_file_name = found_files[0]
         actual_ext = actual_file_name.split(".")[-1] if "." in actual_file_name else "mp4"
 
-        # Generate a clean, descriptive filename for user download
         safe_name = make_safe_filename(raw_title, ext=actual_ext)
 
         final_file = os.path.join(task_dir, actual_file_name)
@@ -478,14 +505,15 @@ def download_file(task_id):
     )
 
 
-# Periodic cleanup of old task files (older than 1 hour)
 def cleanup_old_files():
+    """Periodically cleans up cache files older than 1 hour (runs on standalone server)."""
     while True:
         try:
             now = time.time()
+            cache_dir = get_cache_dir()
             for tid, tinfo in list(TASKS.items()):
                 if now - tinfo.get("timestamp", now) > 3600:
-                    task_dir = os.path.join(DOWNLOAD_CACHE_DIR, tid)
+                    task_dir = os.path.join(cache_dir, tid)
                     if os.path.exists(task_dir):
                         shutil.rmtree(task_dir, ignore_errors=True)
                     TASKS.pop(tid, None)
@@ -494,10 +522,8 @@ def cleanup_old_files():
         time.sleep(1800)
 
 
-threading.Thread(target=cleanup_old_files, daemon=True).start()
-
-
 if __name__ == "__main__":
+    threading.Thread(target=cleanup_old_files, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     print("=" * 60)
     print(" OmniDownloader Web Server Running!")
